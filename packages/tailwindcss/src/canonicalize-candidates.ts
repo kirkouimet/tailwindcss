@@ -336,6 +336,46 @@ function collapseCandidates(options: InternalCanonicalizeOptions, candidates: st
       }
     }
 
+    // Fast path: compute otherUtilities using only static utilities first.
+    // If static utilities alone produce no links between candidates, skip the
+    // expensive dynamic utility computation entirely. The dynamic utility
+    // lookup iterates ALL functional utilities which is O(candidates × roots).
+    {
+      // Collect static-only other utilities per candidate
+      let staticOtherUtilities = candidatePropertiesValues.map((propertyValues) => {
+        let result: Set<string> | null = null
+        for (let property of propertyValues.keys()) {
+          let others = new Set<string>()
+          for (let group of staticUtilities.get(property).values()) {
+            for (let candidate of group) {
+              others.add(candidate)
+            }
+          }
+          if (result === null) result = others
+          else result = intersection(result, others)
+          if (result!.size === 0) break
+        }
+        return result ?? new Set<string>()
+      })
+
+      // Check if any two candidates share a static utility
+      let hasStaticLink = false
+      for (let i = 0; i < staticOtherUtilities.length && !hasStaticLink; i++) {
+        for (let j = i + 1; j < staticOtherUtilities.length && !hasStaticLink; j++) {
+          for (let utility of staticOtherUtilities[i]) {
+            if (staticOtherUtilities[j].has(utility)) {
+              hasStaticLink = true
+              break
+            }
+          }
+        }
+      }
+
+      if (!hasStaticLink) {
+        return candidates
+      }
+    }
+
     let dynamicUtilities = new DefaultMap((candidate: string) => {
       let result = new DefaultMap(
         (_property: string) => new DefaultMap((_value: string) => new Set<string>()),

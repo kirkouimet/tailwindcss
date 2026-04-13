@@ -214,6 +214,187 @@ export async function applyCompatibilityHooks({
   return features
 }
 
+export function applyCompatibilityHooksSync({
+  designSystem,
+  base,
+  ast,
+  loadModule,
+  sources,
+}: {
+  designSystem: DesignSystem
+  base: string
+  ast: AstNode[]
+  loadModule: (
+    path: string,
+    base: string,
+    resourceHint: 'plugin' | 'config',
+  ) => {
+    path: string
+    base: string
+    module: any
+  }
+  sources: { base: string; pattern: string; negated: boolean }[]
+}) {
+  let features = Features.None
+  let pluginPaths: [
+    { id: string; base: string; reference: boolean; src: SourceLocation | undefined },
+    CssPluginOptions | null,
+  ][] = []
+  let configPaths: {
+    id: string
+    base: string
+    reference: boolean
+    src: SourceLocation | undefined
+  }[] = []
+
+  walk(ast, (node, _ctx) => {
+    if (node.kind !== 'at-rule') return
+    let ctx = cssContext(_ctx)
+
+    // Collect paths from `@plugin` at-rules
+    if (node.name === '@plugin') {
+      if (ctx.parent !== null) {
+        throw new Error('`@plugin` cannot be nested.')
+      }
+
+      let pluginPath = node.params.slice(1, -1)
+      if (pluginPath.length === 0) {
+        throw new Error('`@plugin` must have a path.')
+      }
+
+      let options: CssPluginOptions = {}
+
+      for (let decl of node.nodes ?? []) {
+        if (decl.kind !== 'declaration') {
+          throw new Error(
+            `Unexpected \`@plugin\` option:\n\n${toCss([decl])}\n\n\`@plugin\` options must be a flat list of declarations.`,
+          )
+        }
+
+        if (decl.value === undefined) continue
+
+        let value: CssPluginOptions[keyof CssPluginOptions] = decl.value
+
+        let parts = segment(value, ',').map((part) => {
+          part = part.trim()
+
+          if (part === 'null') {
+            return null
+          } else if (part === 'true') {
+            return true
+          } else if (part === 'false') {
+            return false
+          } else if (!Number.isNaN(Number(part))) {
+            return Number(part)
+          } else if (
+            (part[0] === '"' && part[part.length - 1] === '"') ||
+            (part[0] === "'" && part[part.length - 1] === "'")
+          ) {
+            return part.slice(1, -1)
+          } else if (part[0] === '{' && part[part.length - 1] === '}') {
+            throw new Error(
+              `The plugin "${pluginPath}" does not accept options.\n\nUsing an object as a plugin option is currently only supported in JavaScript configuration files.`,
+            )
+          }
+
+          return part
+        })
+
+        options[decl.property] = parts.length === 1 ? parts[0] : parts
+      }
+
+      pluginPaths.push([
+        {
+          id: pluginPath,
+          base: ctx.context.base as string,
+          reference: !!ctx.context.reference,
+          src: node.src,
+        },
+        Object.keys(options).length > 0 ? options : null,
+      ])
+
+      features |= Features.JsPluginCompat
+      return WalkAction.Replace([])
+    }
+
+    // Collect paths from `@config` at-rules
+    if (node.name === '@config') {
+      if (node.nodes.length > 0) {
+        throw new Error('`@config` cannot have a body.')
+      }
+
+      if (ctx.parent !== null) {
+        throw new Error('`@config` cannot be nested.')
+      }
+
+      configPaths.push({
+        id: node.params.slice(1, -1),
+        base: ctx.context.base as string,
+        reference: !!ctx.context.reference,
+        src: node.src,
+      })
+      features |= Features.JsPluginCompat
+      return WalkAction.Replace([])
+    }
+  })
+
+  registerLegacyUtilities(designSystem)
+
+  let resolveThemeVariableValue = designSystem.resolveThemeValue
+
+  designSystem.resolveThemeValue = function resolveThemeValue(path: string, forceInline?: boolean) {
+    if (path.startsWith('--')) {
+      return resolveThemeVariableValue(path, forceInline)
+    }
+
+    features |= upgradeToFullPluginSupport({
+      designSystem,
+      base,
+      ast,
+      sources,
+      configs: [],
+      pluginDetails: [],
+    })
+    return designSystem.resolveThemeValue(path, forceInline)
+  }
+
+  if (!pluginPaths.length && !configPaths.length) return Features.None
+
+  let configs = configPaths.map(({ id, base, reference, src }) => {
+    let loaded = loadModule(id, base, 'config')
+    return {
+      path: id,
+      base: loaded.base,
+      config: loaded.module as UserConfig,
+      reference,
+      src,
+    }
+  })
+
+  let pluginDetails = pluginPaths.map(([{ id, base, reference, src }, pluginOptions]) => {
+    let loaded = loadModule(id, base, 'plugin')
+    return {
+      path: id,
+      base: loaded.base,
+      plugin: loaded.module as Plugin,
+      options: pluginOptions,
+      reference,
+      src,
+    }
+  })
+
+  features |= upgradeToFullPluginSupport({
+    designSystem,
+    base,
+    ast,
+    sources,
+    configs,
+    pluginDetails,
+  })
+
+  return features
+}
+
 function upgradeToFullPluginSupport({
   designSystem,
   base,

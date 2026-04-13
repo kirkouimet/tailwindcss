@@ -17,8 +17,8 @@ import {
   type Context,
   type StyleRule,
 } from './ast'
-import { substituteAtImports } from './at-import'
-import { applyCompatibilityHooks } from './compat/apply-compat-hooks'
+import { substituteAtImports, substituteAtImportsSync } from './at-import'
+import { applyCompatibilityHooks, applyCompatibilityHooksSync } from './compat/apply-compat-hooks'
 import type { UserConfig } from './compat/config/types'
 import { type Plugin } from './compat/plugin-api'
 import { compileCandidates } from './compile'
@@ -72,6 +72,29 @@ type CompileOptions = {
     base: string
     content: string
   }>
+}
+
+type CompileSyncOptions = {
+  base?: string
+  from?: string
+  polyfills?: Polyfills
+  loadModule?: (
+    id: string,
+    base: string,
+    resourceHint: 'plugin' | 'config',
+  ) => {
+    path: string
+    base: string
+    module: Plugin | Config
+  }
+  loadStylesheet?: (
+    id: string,
+    base: string,
+  ) => {
+    path: string
+    base: string
+    content: string
+  }
 }
 
 function throwOnLoadModule(): never {
@@ -138,19 +161,22 @@ export const enum Features {
   AtTheme = 1 << 6,
 }
 
-async function parseCss(
-  ast: AstNode[],
-  {
-    base = '',
-    from,
-    loadModule = throwOnLoadModule,
-    loadStylesheet = throwOnLoadStylesheet,
-  }: CompileOptions = {},
-) {
-  let features = Features.None
-  ast = [contextNode({ base }, ast)] as AstNode[]
+type CompatHook = (args: {
+  designSystem: DesignSystem
+  base: string
+  ast: AstNode[]
+  loadModule: any
+  sources: { base: string; pattern: string; negated: boolean }[]
+}) => Features | Promise<Features>
 
-  features |= await substituteAtImports(ast, base, loadStylesheet, 0, from !== undefined)
+function parseCssCore(
+  ast: AstNode[],
+  base: string,
+  importFeatures: Features,
+  compatHook: CompatHook,
+  loadModule: any,
+) {
+  let features = importFeatures
 
   let important = null as boolean | null
   let theme = new Theme()
@@ -611,7 +637,7 @@ async function parseCss(
   // of random arguments because it really just needs access to "the world" to
   // do whatever ungodly things it needs to do to make things backwards
   // compatible without polluting core.
-  features |= await applyCompatibilityHooks({
+  let compatFeatures = compatHook({
     designSystem,
     base,
     ast,
@@ -619,90 +645,143 @@ async function parseCss(
     sources,
   })
 
-  for (let name of customVariants.keys()) {
-    // Pre-register the variant to ensure its position in the variant list is
-    // based on the order we see them in the CSS.
-    designSystem.variants.static(name, () => {})
-  }
+  function finalize(compatFeatures: Features) {
+    features |= compatFeatures
 
-  // Register custom variants in order
-  for (let variant of topologicalSort(customVariantDependencies, {
-    onCircularDependency(path, start) {
-      let output = toCss(
-        path.map((name, idx) => {
-          return atRule('@custom-variant', name, [atRule('@variant', path[idx + 1] ?? start, [])])
-        }),
-      )
-        .replaceAll(';', ' { … }')
-        .replace(`@custom-variant ${start} {`, `@custom-variant ${start} { /* ← */`)
-
-      throw new Error(`Circular dependency detected in custom variants:\n\n${output}`)
-    },
-  })) {
-    customVariants.get(variant)?.(designSystem)
-  }
-
-  for (let customUtility of customUtilities) {
-    customUtility(designSystem)
-  }
-
-  // Output final set of theme variables at the position of the first
-  // `@theme` rule.
-  if (firstThemeRule) {
-    let nodes = []
-
-    for (let [key, value] of designSystem.theme.entries()) {
-      if (value.options & ThemeOptions.REFERENCE) continue
-      let node = decl(escape(key), value.value)
-      node.src = value.src
-      nodes.push(node)
+    for (let name of customVariants.keys()) {
+      // Pre-register the variant to ensure its position in the variant list is
+      // based on the order we see them in the CSS.
+      designSystem.variants.static(name, () => {})
     }
 
-    let keyframesRules = designSystem.theme.getKeyframes()
-    for (let keyframes of keyframesRules) {
-      // Wrap `@keyframes` in `AtRoot` so they are hoisted out of `:root` when
-      // printing. We push it to the top-level of the AST so that an eventual
-      // `@reference` does not cut it out when printing the document.
-      ast.push(context({ theme: true }, [atRoot([keyframes])]))
+    // Register custom variants in order
+    for (let variant of topologicalSort(customVariantDependencies, {
+      onCircularDependency(path, start) {
+        let output = toCss(
+          path.map((name, idx) => {
+            return atRule('@custom-variant', name, [
+              atRule('@variant', path[idx + 1] ?? start, []),
+            ])
+          }),
+        )
+          .replaceAll(';', ' { … }')
+          .replace(`@custom-variant ${start} {`, `@custom-variant ${start} { /* ← */`)
+
+        throw new Error(`Circular dependency detected in custom variants:\n\n${output}`)
+      },
+    })) {
+      customVariants.get(variant)?.(designSystem)
     }
 
-    firstThemeRule.nodes = [context({ theme: true }, nodes)]
-  }
-
-  features |= substituteAtVariant(ast, designSystem)
-  features |= substituteFunctions(ast, designSystem)
-  features |= substituteAtApply(ast, designSystem)
-
-  // Replace the `@tailwind utilities` node with a context since it prints
-  // children directly.
-  if (utilitiesNode) {
-    let node = utilitiesNode as AstNode as Context
-    node.kind = 'context'
-    node.context = {}
-  }
-
-  // Remove `@utility`, we couldn't replace it before yet because we had to
-  // handle the nested `@apply` at-rules first.
-  walk(ast, (node) => {
-    if (node.kind !== 'at-rule') return
-
-    if (node.name === '@utility') {
-      return WalkAction.Replace([])
+    for (let customUtility of customUtilities) {
+      customUtility(designSystem)
     }
 
-    // The `@utility` has to be top-level, therefore we don't have to traverse
-    // into nested trees.
-    return WalkAction.Skip
-  })
+    // Output final set of theme variables at the position of the first
+    // `@theme` rule.
+    if (firstThemeRule) {
+      let nodes = []
 
-  return {
-    designSystem,
-    ast,
-    sources,
-    root,
-    utilitiesNode,
-    features,
-    inlineCandidates,
+      for (let [key, value] of designSystem.theme.entries()) {
+        if (value.options & ThemeOptions.REFERENCE) continue
+        let node = decl(escape(key), value.value)
+        node.src = value.src
+        nodes.push(node)
+      }
+
+      let keyframesRules = designSystem.theme.getKeyframes()
+      for (let keyframes of keyframesRules) {
+        // Wrap `@keyframes` in `AtRoot` so they are hoisted out of `:root` when
+        // printing. We push it to the top-level of the AST so that an eventual
+        // `@reference` does not cut it out when printing the document.
+        ast.push(context({ theme: true }, [atRoot([keyframes])]))
+      }
+
+      firstThemeRule.nodes = [context({ theme: true }, nodes)]
+    }
+
+    features |= substituteAtVariant(ast, designSystem)
+    features |= substituteFunctions(ast, designSystem)
+    features |= substituteAtApply(ast, designSystem)
+
+    // Replace the `@tailwind utilities` node with a context since it prints
+    // children directly.
+    if (utilitiesNode) {
+      let node = utilitiesNode as AstNode as Context
+      node.kind = 'context'
+      node.context = {}
+    }
+
+    // Remove `@utility`, we couldn't replace it before yet because we had to
+    // handle the nested `@apply` at-rules first.
+    walk(ast, (node) => {
+      if (node.kind !== 'at-rule') return
+
+      if (node.name === '@utility') {
+        return WalkAction.Replace([])
+      }
+
+      // The `@utility` has to be top-level, therefore we don't have to traverse
+      // into nested trees.
+      return WalkAction.Skip
+    })
+
+    return {
+      designSystem,
+      ast,
+      sources,
+      root,
+      utilitiesNode,
+      features,
+      inlineCandidates,
+    }
+  }
+
+  // Support both sync and async compat hooks
+  if (compatFeatures instanceof Promise) {
+    return compatFeatures.then(finalize)
+  }
+  return finalize(compatFeatures)
+}
+
+async function parseCss(
+  ast: AstNode[],
+  {
+    base = '',
+    from,
+    loadModule = throwOnLoadModule,
+    loadStylesheet = throwOnLoadStylesheet,
+  }: CompileOptions = {},
+) {
+  ast = [contextNode({ base }, ast)] as AstNode[]
+  let importFeatures = await substituteAtImports(ast, base, loadStylesheet, 0, from !== undefined)
+
+  return parseCssCore(ast, base, importFeatures, applyCompatibilityHooks, loadModule) as ReturnType<
+    typeof parseCssCore
+  > &
+    Promise<any>
+}
+
+function parseCssSync(
+  ast: AstNode[],
+  {
+    base = '',
+    from,
+    loadModule = throwOnLoadModule,
+    loadStylesheet = throwOnLoadStylesheet,
+  }: CompileSyncOptions = {},
+) {
+  ast = [contextNode({ base }, ast)] as AstNode[]
+  let importFeatures = substituteAtImportsSync(ast, base, loadStylesheet, 0, from !== undefined)
+
+  return parseCssCore(ast, base, importFeatures, applyCompatibilityHooksSync, loadModule) as {
+    designSystem: DesignSystem
+    ast: AstNode[]
+    sources: { base: string; pattern: string; negated: boolean }[]
+    root: Root
+    utilitiesNode: AtRule | null
+    features: Features
+    inlineCandidates: string[]
   }
 }
 
@@ -856,6 +935,11 @@ export async function compile(
 
 export async function __unstable__loadDesignSystem(css: string, opts: CompileOptions = {}) {
   let result = await parseCss(CSS.parse(css, { from: opts.from }), opts)
+  return result.designSystem
+}
+
+export function __unstable__loadDesignSystemSync(css: string, opts: CompileSyncOptions = {}) {
+  let result = parseCssSync(CSS.parse(css, { from: opts.from }), opts)
   return result.designSystem
 }
 

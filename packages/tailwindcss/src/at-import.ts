@@ -147,6 +147,66 @@ export function parseImportParams(params: ValueParser.ValueAstNode[]) {
   return { uri, layer, media, supports }
 }
 
+type LoadStylesheetSync = (
+  id: string,
+  basedir: string,
+) => {
+  path: string
+  base: string
+  content: string
+}
+
+export function substituteAtImportsSync(
+  ast: AstNode[],
+  base: string,
+  loadStylesheet: LoadStylesheetSync,
+  recurseCount = 0,
+  track = false,
+) {
+  let features = Features.None
+
+  walk(ast, (node) => {
+    if (node.kind === 'at-rule' && (node.name === '@import' || node.name === '@reference')) {
+      let parsed = parseImportParams(ValueParser.parse(node.params))
+      if (parsed === null) return
+      if (node.name === '@reference') {
+        parsed.media = 'reference'
+      }
+
+      features |= Features.AtImport
+
+      let { uri, layer, media, supports } = parsed
+
+      // Skip importing data or remote URIs
+      if (uri.startsWith('data:')) return
+      if (uri.startsWith('http://') || uri.startsWith('https://')) return
+
+      if (recurseCount > 100) {
+        throw new Error(
+          `Exceeded maximum recursion depth while resolving \`${uri}\` in \`${base}\`)`,
+        )
+      }
+
+      let loaded = loadStylesheet(uri, base)
+      let importedAst = CSS.parse(loaded.content, { from: track ? loaded.path : undefined })
+      substituteAtImportsSync(importedAst, loaded.base, loadStylesheet, recurseCount + 1, track)
+
+      let contextNode = context({}, [])
+      contextNode.nodes = buildImportNodes(
+        node,
+        [context({ base: loaded.base }, importedAst)],
+        layer,
+        media,
+        supports,
+      )
+
+      return WalkAction.ReplaceSkip(contextNode)
+    }
+  })
+
+  return features
+}
+
 function buildImportNodes(
   importNode: AstNode,
   importedAst: AstNode[],
